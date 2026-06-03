@@ -301,11 +301,19 @@ async def do_research(query: str, num_sources: int = 5, top_chunks: int = 8,
 def build_mcp():
     """Construct the FastMCP server, preload the model, register tools."""
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.transport_security import TransportSecuritySettings
 
-    mcp = FastMCP("web-search")
+    # Trusted internal cluster: disable DNS-rebinding host validation so
+    # requests via the service FQDN (not just localhost) are accepted.
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+        allowed_hosts=["*"],
+        allowed_origins=["*"],
+    )
 
-    # Preload the reranker at construction so the first tool call is fast
-    # and (in k8s) the readiness probe only passes once the model is ready.
+    mcp = FastMCP("web-search", transport_security=security)
+
+    # Preload the reranker at construction (first call fast; readiness gate).
     print("[startup] warming reranker...", file=sys.stderr, flush=True)
     get_reranker()
     print("[startup] reranker warm — server ready.", file=sys.stderr, flush=True)
@@ -323,9 +331,15 @@ def build_mcp():
                 'month', 'year'. Use 'day' or 'week' for recent news.
             news: Set True to restrict to news sources (recency-focused).
         """
-        if time_range not in VALID_TIME_RANGES:
-            time_range = ""
-        return await do_quick(query, time_range=time_range, news=news)
+        try:
+            if time_range not in VALID_TIME_RANGES:
+                time_range = ""
+            return await do_quick(query, time_range=time_range, news=news)
+        except Exception as e:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            return f"ERROR in quick_answer: {type(e).__name__}: {e}"
 
     @mcp.tool()
     async def deep_research(query: str, num_sources: int = 5,
@@ -337,18 +351,24 @@ def build_mcp():
 
         Args:
             query: The research question. Be specific.
-            num_sources: How many sources to crawl (3-8). More = thorough but slower.
+            num_sources: How many sources to crawl (3-8).
             top_chunks: How many passages to return (4-12).
             time_range: Optional recency filter: '', 'day', 'week', 'month', 'year'.
             news: Set True to restrict to news sources.
         """
-        if time_range not in VALID_TIME_RANGES:
-            time_range = ""
-        num_sources = max(1, min(num_sources, 8))
-        top_chunks = max(1, min(top_chunks, 12))
-        return await do_research(query, num_sources=num_sources,
-                                 top_chunks=top_chunks, time_range=time_range,
-                                 news=news)
+        try:
+            if time_range not in VALID_TIME_RANGES:
+                time_range = ""
+            num_sources = max(1, min(num_sources, 8))
+            top_chunks = max(1, min(top_chunks, 12))
+            return await do_research(query, num_sources=num_sources,
+                                     top_chunks=top_chunks, time_range=time_range,
+                                     news=news)
+        except Exception as e:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            return f"ERROR in deep_research: {type(e).__name__}: {e}"
 
     return mcp
 
