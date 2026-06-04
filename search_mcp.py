@@ -67,7 +67,7 @@ TORCH_THREADS = int(os.getenv("TORCH_THREADS", "6"))
 PRELOAD_RERANKER = os.getenv("PRELOAD_RERANKER", "true").lower() in ("1", "true", "yes")
 
 VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() in ("1", "true", "yes")
-MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
 PORT = int(os.getenv("PORT", "8000"))
 
 # Crawl cache: use cache for most searches, bypass only for very fresh/news-like calls.
@@ -853,8 +853,12 @@ async def do_deep_research(
 # ---------------- MCP server ----------------
 def build_mcp():
     from mcp.server.fastmcp import FastMCP
-
-    mcp = FastMCP("web-search")
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+        allowed_hosts=["*"],
+        allowed_origins=["*"],
+    )
+    mcp = FastMCP("web-search", transport_security=security)
 
     if PRELOAD_RERANKER:
         print("[startup] warming reranker...", file=sys.stderr, flush=True)
