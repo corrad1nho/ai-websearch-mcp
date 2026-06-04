@@ -853,6 +853,7 @@ async def do_deep_research(
 # ---------------- MCP server ----------------
 def build_mcp():
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.transport_security import TransportSecuritySettings
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
         allowed_hosts=["*"],
