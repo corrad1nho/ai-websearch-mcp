@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
 """
-SearXNG + Crawl4AI + reranker search pipeline for AI agents (MCP server).
+CPU-friendly SearXNG + Crawl4AI + MiniLM reranker MCP server.
 
-Two content-returning tools:
-  - quick_answer:  shallow crawl of top results, lean output, fast-ish
-  - deep_research: thorough multi-source crawl, more passages
+Tools:
+  - web_search_snippets:      SearXNG only, fastest, no crawl
+  - quick_search:             crawl top 3 pages, small rerank budget
+  - comprehensive_search:     crawl top 10 pages, medium rerank budget
+  - deep_research:            deep crawl interesting seeds up to depth 3, guarded budget
 
-CLI test modes:
-  python search_mcp.py quick    "latest qwen3 release" --time day
-  python search_mcp.py quick    "important tech news"   --time day --news
-  python search_mcp.py research "how does qwen3 attention work" --sources 5 --chunks 8
-  python search_mcp.py search   "qwen3" --time week          # raw snippets (debug)
-  python search_mcp.py bench    "qwen3 news"                 # warm-process timing
+Main design choices:
+  - One CPU-friendly reranker only: cross-encoder/ms-marco-MiniLM-L-6-v2
+  - quick_search is intentionally aggressive about speed
+  - Crawl4AI cache is used by default except for very fresh searches
+  - crawled chunks are quality-filtered before reranking and weak scores are dropped
 
-MCP server modes:
-  python search_mcp.py mcp                 # transport from MCP_TRANSPORT env (default stdio)
-  MCP_TRANSPORT=streamable-http python search_mcp.py mcp     # HTTP for in-cluster
+CLI examples:
+  python search_mcp snippets "qwen3 release" --freshness week --category news
+  python search_mcp quick "kubernetes sidecar containers" --category documentation
+  python search_mcp comprehensive "crawl4ai deep crawling" --category documentation
+  python search_mcp deep "kubernetes challenges" --category documentation --depth 3
+  python search_mcp bench "Ai news" --runs 3
+  python search_mcp mcp
 
-Prereqs (port-forward your cluster services for local testing):
-  kubectl -n searxng  port-forward svc/searxng  8080:8080
-  kubectl -n crawl4ai port-forward svc/crawl4ai 11235:11235
+Recommended CPU-only env for Kubernetes:
+  RERANK_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+  RERANK_DEVICE=cpu
+  TORCH_THREADS=6
+  TOKENIZERS_PARALLELISM=false
+  PRELOAD_RERANKER=true
 
-Env:
-  SEARXNG_URL    default http://localhost:8080
-  CRAWL4AI_URL   default http://localhost:11235
-  RERANK_MODEL   default BAAI/bge-reranker-base
-  RERANK_DEVICE  default auto    (auto|cpu|cuda)
-  TORCH_THREADS  default 6       (CPU thread cap)
-  VERIFY_SSL     default false   (skip TLS verify for internal/self-signed)
-  MCP_TRANSPORT  default stdio   (stdio|streamable-http|sse)
-  PORT           default 8000    (HTTP transport port)
+Crawl4AI note:
+  This script targets the common /crawl API shape used by recent Crawl4AI
+  releases. Deep-crawl schema support has changed across versions, so
+  fetch_deep_pages() gracefully falls back to shallow seed crawling if the
+  server rejects the deep-crawl payload.
 """
 
 # ---- Env caps MUST be set before torch / sentence-transformers import ----
@@ -40,335 +44,922 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import sys
+import re
 import time
 import asyncio
 import argparse
 import warnings
+from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 # ---------------- Config ----------------
-SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
-CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://localhost:11235")
-RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base")
-RERANK_DEVICE = os.getenv("RERANK_DEVICE", "auto")
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080").rstrip("/")
+CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://localhost:11235").rstrip("/")
+
+# One CPU-friendly model. Keep the image/cache simple.
+RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RERANK_DEVICE = os.getenv("RERANK_DEVICE", "cpu")
 TORCH_THREADS = int(os.getenv("TORCH_THREADS", "6"))
+PRELOAD_RERANKER = os.getenv("PRELOAD_RERANKER", "true").lower() in ("1", "true", "yes")
+
 VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() in ("1", "true", "yes")
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
 PORT = int(os.getenv("PORT", "8000"))
 
-VALID_TIME_RANGES = {"", "day", "week", "month", "year"}
+# Crawl cache: use cache for most searches, bypass only for very fresh/news-like calls.
+CRAWL_CACHE_MODE = os.getenv("CRAWL_CACHE_MODE", "enabled")
 
-# ---------------- Reranker ----------------
+# Search/crawl budgets. Tune these, not the model.
+SNIPPETS_RESULTS = int(os.getenv("SNIPPETS_RESULTS", "8"))
+QUICK_SEARCH_RESULTS = int(os.getenv("QUICK_SEARCH_RESULTS", "8"))
+QUICK_CRAWL_TOP_N = int(os.getenv("QUICK_CRAWL_TOP_N", "3"))
+QUICK_TOP_CHUNKS = int(os.getenv("QUICK_TOP_CHUNKS", "4"))
+QUICK_MAX_RERANK_DOCS = int(os.getenv("QUICK_MAX_RERANK_DOCS", "18"))
+QUICK_MAX_CHUNKS_PER_PAGE = int(os.getenv("QUICK_MAX_CHUNKS_PER_PAGE", "5"))
+QUICK_PAGE_TIMEOUT_MS = int(os.getenv("QUICK_PAGE_TIMEOUT_MS", "6000"))
+
+COMPREHENSIVE_SEARCH_RESULTS = int(os.getenv("COMPREHENSIVE_SEARCH_RESULTS", "16"))
+COMPREHENSIVE_CRAWL_TOP_N = int(os.getenv("COMPREHENSIVE_CRAWL_TOP_N", "10"))
+COMPREHENSIVE_TOP_CHUNKS = int(os.getenv("COMPREHENSIVE_TOP_CHUNKS", "10"))
+COMPREHENSIVE_MAX_RERANK_DOCS = int(os.getenv("COMPREHENSIVE_MAX_RERANK_DOCS", "60"))
+COMPREHENSIVE_MAX_CHUNKS_PER_PAGE = int(os.getenv("COMPREHENSIVE_MAX_CHUNKS_PER_PAGE", "8"))
+COMPREHENSIVE_PAGE_TIMEOUT_MS = int(os.getenv("COMPREHENSIVE_PAGE_TIMEOUT_MS", "10000"))
+
+DEEP_SEARCH_RESULTS = int(os.getenv("DEEP_SEARCH_RESULTS", "12"))
+DEEP_SEED_TOP_N = int(os.getenv("DEEP_SEED_TOP_N", "3"))
+DEEP_MAX_DEPTH = int(os.getenv("DEEP_MAX_DEPTH", "3"))
+DEEP_MAX_PAGES_TOTAL = int(os.getenv("DEEP_MAX_PAGES_TOTAL", "30"))
+DEEP_TOP_CHUNKS = int(os.getenv("DEEP_TOP_CHUNKS", "16"))
+DEEP_MAX_RERANK_DOCS = int(os.getenv("DEEP_MAX_RERANK_DOCS", "120"))
+DEEP_MAX_CHUNKS_PER_PAGE = int(os.getenv("DEEP_MAX_CHUNKS_PER_PAGE", "6"))
+DEEP_PAGE_TIMEOUT_MS = int(os.getenv("DEEP_PAGE_TIMEOUT_MS", "12000"))
+
+VALID_FRESHNESS = {"", "day", "week", "month", "year"}
+VALID_CATEGORIES = {
+    "general",
+    "news",
+    "academic",
+    "science",
+    "it",
+    "documentation",
+    "github",
+    "forums",
+    "reddit",
+    "stackoverflow",
+}
+
+# Quality gates. CrossEncoder scores may be negative; this is a pragmatic
+# threshold to avoid returning complete garbage when the crawler extracts poor text.
+MIN_RERANK_SCORE = float(os.getenv("MIN_RERANK_SCORE", "-6.0"))
+MIN_CHUNK_CHARS = int(os.getenv("MIN_CHUNK_CHARS", "250"))
+MIN_CHUNK_WORDS = int(os.getenv("MIN_CHUNK_WORDS", "35"))
+MAX_TABLE_PIPE_RATIO = float(os.getenv("MAX_TABLE_PIPE_RATIO", "0.08"))
+MAX_SHORT_OR_SYMBOLIC_LINE_RATIO = float(os.getenv("MAX_SHORT_OR_SYMBOLIC_LINE_RATIO", "0.45"))
+MAX_LINK_DENSITY = float(os.getenv("MAX_LINK_DENSITY", "0.35"))
+MAX_REPEAT_LINE_RATIO = float(os.getenv("MAX_REPEAT_LINE_RATIO", "0.35"))
+
+# Conservative SearXNG mapping. Engine names only work if enabled in your SearXNG.
+# If an engine/category is missing, SearXNG normally returns fewer/no results rather
+# than crashing. Still, default to broad categories where possible.
+CATEGORY_MAP: dict[str, dict[str, str]] = {
+    "general": {},
+    "news": {"categories": "news"},
+    "academic": {"categories": "science"},
+    "science": {"categories": "science"},
+    "it": {"categories": "it"},
+    "documentation": {"categories": "it"},
+    "github": {"engines": "github"},
+    "forums": {"engines": "reddit,stackoverflow,stackexchange"},
+    "reddit": {"engines": "reddit"},
+    "stackoverflow": {"engines": "stackoverflow,stackexchange"},
+}
+
+# Optional query hints for categories where SearXNG categories are too broad.
+# These are intentionally mild, because source bias can hurt recall.
+CATEGORY_QUERY_HINTS: dict[str, str] = {
+    "documentation": "official documentation docs",
+    "github": "GitHub repository issues pull requests",
+    "forums": "forum discussion reddit stackoverflow",
+    "reddit": "reddit discussion",
+    "stackoverflow": "stackoverflow stackexchange",
+}
+
+# ---------------- Globals ----------------
 _reranker = None
+_http_client: httpx.AsyncClient | None = None
 
 
-def _resolve_device() -> str:
-    if RERANK_DEVICE != "auto":
-        return RERANK_DEVICE
+@dataclass(frozen=True)
+class ModeConfig:
+    search_results: int
+    crawl_top_n: int
+    top_chunks: int
+    max_rerank_docs: int
+    max_chunks_per_page: int
+    page_timeout_ms: int
+    chunk_size: int
+    chunk_overlap: int
+
+
+QUICK_CFG = ModeConfig(
+    search_results=QUICK_SEARCH_RESULTS,
+    crawl_top_n=QUICK_CRAWL_TOP_N,
+    top_chunks=QUICK_TOP_CHUNKS,
+    max_rerank_docs=QUICK_MAX_RERANK_DOCS,
+    max_chunks_per_page=QUICK_MAX_CHUNKS_PER_PAGE,
+    page_timeout_ms=QUICK_PAGE_TIMEOUT_MS,
+    chunk_size=900,
+    chunk_overlap=100,
+)
+
+COMPREHENSIVE_CFG = ModeConfig(
+    search_results=COMPREHENSIVE_SEARCH_RESULTS,
+    crawl_top_n=COMPREHENSIVE_CRAWL_TOP_N,
+    top_chunks=COMPREHENSIVE_TOP_CHUNKS,
+    max_rerank_docs=COMPREHENSIVE_MAX_RERANK_DOCS,
+    max_chunks_per_page=COMPREHENSIVE_MAX_CHUNKS_PER_PAGE,
+    page_timeout_ms=COMPREHENSIVE_PAGE_TIMEOUT_MS,
+    chunk_size=1100,
+    chunk_overlap=150,
+)
+
+DEEP_CFG = ModeConfig(
+    search_results=DEEP_SEARCH_RESULTS,
+    crawl_top_n=DEEP_SEED_TOP_N,
+    top_chunks=DEEP_TOP_CHUNKS,
+    max_rerank_docs=DEEP_MAX_RERANK_DOCS,
+    max_chunks_per_page=DEEP_MAX_CHUNKS_PER_PAGE,
+    page_timeout_ms=DEEP_PAGE_TIMEOUT_MS,
+    chunk_size=1200,
+    chunk_overlap=160,
+)
+
+# ---------------- Helpers ----------------
+def _valid_freshness(value: str) -> str:
+    return value if value in VALID_FRESHNESS else ""
+
+
+def _valid_category(value: str) -> str:
+    value = (value or "general").strip().lower().replace("-", "_")
+    return value if value in VALID_CATEGORIES else "general"
+
+
+def _normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _domain(url: str) -> str:
     try:
-        import torch
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        return urlparse(url).netloc.lower().removeprefix("www.")
     except Exception:
-        return "cpu"
+        return ""
 
 
-def get_reranker():
-    """Lazy-load the cross-encoder once per process; cached thereafter."""
-    global _reranker
-    if _reranker is None:
-        import torch
-        device = _resolve_device()
-        if device == "cpu":
-            torch.set_num_threads(TORCH_THREADS)
-        from sentence_transformers import CrossEncoder
-        print(f"[init] loading reranker '{RERANK_MODEL}' on {device}...",
-              file=sys.stderr, flush=True)
-        t0 = time.time()
-        _reranker = CrossEncoder(RERANK_MODEL, device=device, max_length=512)
-        print(f"[init] reranker ready in {time.time()-t0:.1f}s",
-              file=sys.stderr, flush=True)
-    return _reranker
-
-
-# ---------------- SearXNG ----------------
-async def searxng_search(
-    query: str,
-    num: int = 8,
-    time_range: str = "",
-    news: bool = False,
-) -> list[dict]:
-    """Query SearXNG JSON API.
-
-    time_range: '' | 'day' | 'week' | 'month' | 'year'
-    news: if True, restrict to the 'news' category (recency-focused engines)
-    """
-    if time_range not in VALID_TIME_RANGES:
-        time_range = ""
-
-    params = {"q": query, "format": "json", "safesearch": 0}
-    if time_range:
-        params["time_range"] = time_range
-    if news:
-        params["categories"] = "news"
-
-    async with httpx.AsyncClient(timeout=20, verify=VERIFY_SSL) as client:
-        r = await client.get(f"{SEARXNG_URL}/search", params=params)
-        r.raise_for_status()
-        data = r.json()
-
-    results = data.get("results", [])[:num]
-    return [
-        {"title": x.get("title", ""), "url": x.get("url", ""),
-         "snippet": x.get("content", "")}
-        for x in results if x.get("url")
-    ]
-
-
-# ---------------- Crawl4AI (0.8.x /crawl schema) ----------------
-def _crawl_payload(urls: list[str], page_timeout: int) -> dict:
-    return {
-        "urls": urls,
-        "browser_config": {
-            "type": "BrowserConfig",
-            "params": {
-                "headless": True,
-                "text_mode": True,
-                "light_mode": True,
-            },
-        },
-        "crawler_config": {
-            "type": "CrawlerRunConfig",
-            "params": {
-                "cache_mode": "bypass",
-                "page_timeout": page_timeout,
-                "wait_until": "domcontentloaded",
-                "excluded_tags": ["nav", "footer", "header", "aside",
-                                  "form", "script", "style"],
-                "exclude_external_links": True,
-                "exclude_all_images": True,
-                "markdown_generator": {
-                    "type": "DefaultMarkdownGenerator",
-                    "params": {
-                        "content_filter": {
-                            "type": "PruningContentFilter",
-                            "params": {"threshold": 0.48,
-                                       "threshold_type": "fixed"},
-                        }
-                    },
-                },
-            },
-        },
-    }
-
-
-async def fetch_pages(urls: list[str], page_timeout: int) -> dict[str, str]:
-    if not urls:
-        return {}
-    payload = _crawl_payload(urls, page_timeout)
-    async with httpx.AsyncClient(timeout=120, verify=VERIFY_SSL) as client:
-        r = await client.post(f"{CRAWL4AI_URL}/crawl", json=payload)
-        r.raise_for_status()
-        data = r.json()
-
-    out: dict[str, str] = {}
-    for res in data.get("results", []):
-        if not res.get("success", False):
+def _dedupe_results(results: list[dict]) -> list[dict]:
+    seen_urls: set[str] = set()
+    out: list[dict] = []
+    for r in results:
+        url = r.get("url", "")
+        if not url or url in seen_urls:
             continue
-        url = res.get("url", "")
-        md_field = res.get("markdown")
-        if isinstance(md_field, dict):
-            md = (md_field.get("fit_markdown")
-                  or md_field.get("raw_markdown") or "")
-        else:
-            md = md_field or ""
-        if url and md and md.strip():
-            out[url] = md
+        seen_urls.add(url)
+        out.append(r)
     return out
 
 
-# ---------------- chunk + rerank ----------------
-def chunk_text(text: str, size: int = 1200, overlap: int = 150) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= size:
-        return [text]
-    chunks, start = [], 0
-    while start < len(text):
-        chunks.append(text[start:start + size])
-        start += size - overlap
-    return chunks
+def _query_for_category(query: str, category: str) -> str:
+    """Add a light query hint for categories that benefit from it."""
+    category = _valid_category(category)
+    hint = CATEGORY_QUERY_HINTS.get(category, "")
+    if not hint:
+        return query
+    # Do not add hints when the user already clearly specified source targeting.
+    q_lower = query.lower()
+    if any(marker in q_lower for marker in ("site:", "github", "reddit", "stackoverflow", "official docs", "documentation")):
+        return query
+    return f"{query} {hint}"
 
 
-def rerank(query: str, docs: list[str], top_k: int) -> list[tuple[int, float]]:
+async def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=10.0),
+            verify=VERIFY_SSL,
+            limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
+            follow_redirects=True,
+        )
+    return _http_client
+
+
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+# ---------------- Reranker ----------------
+def get_reranker():
+    """Lazy-load one CPU-friendly cross-encoder; cached per process."""
+    global _reranker
+    if _reranker is None:
+        import torch
+        if RERANK_DEVICE == "cpu":
+            torch.set_num_threads(TORCH_THREADS)
+        from sentence_transformers import CrossEncoder
+        print(
+            f"[init] loading reranker '{RERANK_MODEL}' on {RERANK_DEVICE} "
+            f"with torch_threads={TORCH_THREADS}...",
+            file=sys.stderr,
+            flush=True,
+        )
+        t0 = time.time()
+        _reranker = CrossEncoder(RERANK_MODEL, device=RERANK_DEVICE, max_length=384)
+        print(f"[init] reranker ready in {time.time()-t0:.1f}s", file=sys.stderr, flush=True)
+    return _reranker
+
+
+def rerank(query: str, docs: list[str], top_k: int, batch_size: int = 16) -> list[tuple[int, float]]:
     if not docs:
         return []
     scores = get_reranker().predict(
         [(query, d) for d in docs],
-        batch_size=32,
+        batch_size=batch_size,
         show_progress_bar=False,
     )
     ranked = sorted(enumerate(scores), key=lambda t: t[1], reverse=True)
     return [(i, float(s)) for i, s in ranked[:top_k]]
 
 
-# ---------------- core pipeline ----------------
-async def _crawl_search_rerank(
+def rerank_results_by_snippet(query: str, results: list[dict], top_n: int) -> list[dict]:
+    """First-stage ranking: title + snippet only, before expensive crawling."""
+    if not results:
+        return []
+    docs = [
+        _normalize_space(f"{r.get('title', '')}\n{r.get('snippet', '')}")[:1000]
+        for r in results
+    ]
+    ranked = rerank(query, docs, min(top_n, len(docs)), batch_size=16)
+    return [results[i] for i, _ in ranked]
+
+# ---------------- SearXNG ----------------
+async def searxng_search(query: str, num: int, freshness: str = "", category: str = "general") -> list[dict]:
+    freshness = _valid_freshness(freshness)
+    category = _valid_category(category)
+    effective_query = _query_for_category(query, category)
+
+    params: dict[str, str | int] = {
+        "q": effective_query,
+        "format": "json",
+        "safesearch": 0,
+    }
+    if freshness:
+        params["time_range"] = freshness
+    params.update(CATEGORY_MAP.get(category, {}))
+
+    client = await get_http_client()
+    r = await client.get(f"{SEARXNG_URL}/search", params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    results = []
+    for x in data.get("results", [])[:num]:
+        url = x.get("url") or ""
+        if not url:
+            continue
+        results.append({
+            "title": x.get("title") or url,
+            "url": url,
+            "snippet": x.get("content") or x.get("snippet") or "",
+        })
+    return _dedupe_results(results)
+
+# ---------------- Crawl4AI payloads ----------------
+def _cache_mode_for(freshness: str, category: str) -> str:
+    # Very fresh and news/forum searches are more likely to need live pages.
+    if freshness == "day" or category in {"news", "forums", "reddit", "stackoverflow"}:
+        return "bypass"
+    return CRAWL_CACHE_MODE
+
+
+def _base_browser_config() -> dict:
+    return {
+        "type": "BrowserConfig",
+        "params": {
+            "headless": True,
+            "text_mode": True,
+            "light_mode": True,
+            "ignore_https_errors": not VERIFY_SSL,
+        },
+    }
+
+
+def _base_crawler_params(page_timeout_ms: int, freshness: str, category: str) -> dict:
+    category = _valid_category(category)
+
+    # Quick/default crawling: favor fast, readable content over perfect rendering.
+    params = {
+        "cache_mode": _cache_mode_for(freshness, category),
+        "page_timeout": page_timeout_ms,
+        "wait_until": "domcontentloaded",
+        "scan_full_page": False,
+        "process_iframes": False,
+        "remove_overlay_elements": True,
+        "excluded_tags": [
+            "nav", "footer", "header", "aside", "form", "script", "style",
+            "noscript", "svg", "canvas",
+        ],
+        "exclude_external_links": True,
+        "exclude_social_media_links": True,
+        "exclude_all_images": True,
+        "only_text": False,
+        "markdown_generator": {
+            "type": "DefaultMarkdownGenerator",
+            "params": {
+                "content_filter": {
+                    "type": "PruningContentFilter",
+                    "params": {
+                        "threshold": 0.50,
+                        "threshold_type": "fixed",
+                        "min_word_threshold": 20,
+                    },
+                },
+                "options": {
+                    "ignore_links": False,
+                    "escape_html": False,
+                    "body_width": 0,
+                },
+            },
+        },
+    }
+
+    # Documentation pages often have useful side/main links, but still avoid external links.
+    if category == "documentation":
+        params["excluded_tags"] = [
+            "footer", "header", "form", "script", "style", "noscript", "svg", "canvas"
+        ]
+
+    return params
+
+
+def _crawl_payload(urls: list[str], page_timeout_ms: int, freshness: str, category: str) -> dict:
+    return {
+        "urls": urls,
+        "browser_config": _base_browser_config(),
+        "crawler_config": {
+            "type": "CrawlerRunConfig",
+            "params": _base_crawler_params(page_timeout_ms, freshness, category),
+        },
+    }
+
+
+def _deep_crawl_payload(
+    seed_url: str,
     query: str,
-    num_sources: int,
-    top_chunks: int,
-    page_timeout: int,
-    time_range: str,
-    news: bool,
-    chunk_size: int,
-    timing: bool,
+    max_depth: int,
+    max_pages: int,
+    page_timeout_ms: int,
+    freshness: str,
+    category: str,
+) -> dict:
+    """Crawl4AI deep crawling payload with a fallback in fetch_deep_pages()."""
+    params = _base_crawler_params(page_timeout_ms, freshness, category)
+    params.update({
+        "deep_crawl_strategy": {
+            "type": "BestFirstCrawlingStrategy",
+            "params": {
+                "max_depth": max_depth,
+                "include_external": False,
+                "max_pages": max_pages,
+                "url_scorer": {
+                    "type": "KeywordRelevanceScorer",
+                    "params": {
+                        "keywords": query.split()[:12],
+                        "weight": 0.7,
+                    },
+                },
+            },
+        },
+        "stream": False,
+    })
+    return {
+        "urls": [seed_url],
+        "browser_config": _base_browser_config(),
+        "crawler_config": {
+            "type": "CrawlerRunConfig",
+            "params": params,
+        },
+    }
+
+# ---------------- Crawl4AI parsing/fetching ----------------
+def _extract_markdown(res: dict) -> str:
+    md_field = res.get("markdown")
+    if isinstance(md_field, dict):
+        return (
+            md_field.get("fit_markdown")
+            or md_field.get("markdown_with_citations")
+            or md_field.get("raw_markdown")
+            or ""
+        )
+    return md_field or ""
+
+
+def _extract_crawl_results(data: dict | list) -> dict[str, str]:
+    """Accepts common Crawl4AI response shapes and returns url -> markdown."""
+    if isinstance(data, list):
+        results = data
+    elif isinstance(data, dict):
+        results = data.get("results") or data.get("data") or []
+        if not results and (data.get("url") or data.get("markdown")):
+            results = [data]
+    else:
+        results = []
+
+    out: dict[str, str] = {}
+    for res in results:
+        if not isinstance(res, dict):
+            continue
+        if res.get("success", True) is False:
+            continue
+        url = res.get("url") or res.get("final_url") or ""
+        md = _extract_markdown(res).strip()
+        if url and md:
+            out[url] = md
+    return out
+
+
+async def fetch_pages(urls: list[str], page_timeout_ms: int, freshness: str, category: str) -> dict[str, str]:
+    if not urls:
+        return {}
+    payload = _crawl_payload(urls, page_timeout_ms, freshness, category)
+    client = await get_http_client()
+    r = await client.post(f"{CRAWL4AI_URL}/crawl", json=payload, timeout=120)
+    r.raise_for_status()
+    return _extract_crawl_results(r.json())
+
+
+async def fetch_deep_pages(
+    seed_urls: list[str],
+    query: str,
+    max_depth: int,
+    max_pages_total: int,
+    page_timeout_ms: int,
+    freshness: str,
+    category: str,
+) -> dict[str, str]:
+    if not seed_urls:
+        return {}
+
+    per_seed_budget = max(3, max_pages_total // max(1, len(seed_urls)))
+    client = await get_http_client()
+
+    async def _one(seed: str) -> dict[str, str]:
+        payload = _deep_crawl_payload(
+            seed_url=seed,
+            query=query,
+            max_depth=max_depth,
+            max_pages=per_seed_budget,
+            page_timeout_ms=page_timeout_ms,
+            freshness=freshness,
+            category=category,
+        )
+        try:
+            r = await client.post(f"{CRAWL4AI_URL}/crawl", json=payload, timeout=240)
+            r.raise_for_status()
+            pages = _extract_crawl_results(r.json())
+            if pages:
+                return pages
+        except Exception as exc:
+            print(f"[warn] deep crawl failed for {seed}: {exc}; falling back to shallow", file=sys.stderr)
+        return await fetch_pages([seed], page_timeout_ms, freshness, category)
+
+    batches = await asyncio.gather(*[_one(seed) for seed in seed_urls], return_exceptions=True)
+    out: dict[str, str] = {}
+    for batch in batches:
+        if isinstance(batch, Exception):
+            print(f"[warn] deep crawl batch failed: {batch}", file=sys.stderr)
+            continue
+        for url, md in batch.items():
+            if len(out) >= max_pages_total:
+                break
+            out[url] = md
+    return out
+
+# ---------------- Chunking/ranking/output ----------------
+def chunk_text(text: str, size: int, overlap: int) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        chunk = text[start:start + size].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += max(1, size - overlap)
+    return chunks
+
+
+def is_good_chunk(text: str) -> bool:
+    """Reject crawler/table/navigation junk before expensive reranking."""
+    text = text.strip()
+    if len(text) < MIN_CHUNK_CHARS:
+        return False
+
+    words = re.findall(r"\w+", text)
+    if len(words) < MIN_CHUNK_WORDS:
+        return False
+
+    # Markdown tables from index/reference pages often contain lots of pipes and
+    # symbolic separator lines. They rerank badly but can still leak into top-k
+    # if the candidate set is weak.
+    pipe_ratio = text.count("|") / max(1, len(text))
+    if pipe_ratio > MAX_TABLE_PIPE_RATIO:
+        return False
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    short_or_symbolic = sum(
+        1 for line in lines
+        if len(line) < 20 or re.fullmatch(r"[\|\-\s:_•·]+", line)
+    )
+    if short_or_symbolic / max(1, len(lines)) > MAX_SHORT_OR_SYMBOLIC_LINE_RATIO:
+        return False
+
+    # Link farms / nav pages: many markdown links and little prose.
+    link_count = len(re.findall(r"\[[^\]]+\]\([^\)]+\)", text))
+    if link_count / max(1, len(lines)) > MAX_LINK_DENSITY:
+        return False
+
+    normalized_lines = [_normalize_space(line).lower() for line in lines]
+    if normalized_lines:
+        repeated = len(normalized_lines) - len(set(normalized_lines))
+        if repeated / max(1, len(normalized_lines)) > MAX_REPEAT_LINE_RATIO:
+            return False
+
+    # Mostly punctuation/symbol text is never useful to an LLM.
+    alpha_num = sum(ch.isalnum() for ch in text)
+    if alpha_num / max(1, len(text)) < 0.45:
+        return False
+
+    return True
+
+
+def trim_chunk(text: str, max_chars: int | None = None) -> str:
+    """Clean excessive whitespace while preserving markdown readability."""
+    text = re.sub(r"\n{3,}", "\n\n", text.strip())
+    text = re.sub(r"[ \t]+", " ", text)
+    if max_chars and len(text) > max_chars:
+        cut = text[:max_chars].rsplit(" ", 1)[0].strip()
+        return cut + " …"
+    return text
+
+
+def build_chunk_corpus(pages: dict[str, str], cfg: ModeConfig) -> tuple[list[str], list[str]]:
+    all_chunks: list[str] = []
+    meta: list[str] = []
+    # Prefer diversity: scan each page, keep only decent chunks, and cap per page.
+    for url, md in pages.items():
+        kept_for_page = 0
+        chunks = chunk_text(md, size=cfg.chunk_size, overlap=cfg.chunk_overlap)
+        for ch in chunks:
+            ch = trim_chunk(ch)
+            if not is_good_chunk(ch):
+                continue
+            all_chunks.append(ch)
+            meta.append(url)
+            kept_for_page += 1
+            if len(all_chunks) >= cfg.max_rerank_docs:
+                return all_chunks, meta
+            if kept_for_page >= cfg.max_chunks_per_page:
+                break
+    return all_chunks, meta
+
+
+def format_snippets(results: list[dict], timing_line: str | None = None) -> str:
+    if not results:
+        return "No results found."
+    body = "## Search results\n\n" + "\n\n".join(
+        f"{i}. [{r['title']}]({r['url']})\n{r.get('snippet', '').strip()}"
+        for i, r in enumerate(results, 1)
+    )
+    if timing_line:
+        body += f"\n\n---\n{timing_line}"
+    return body
+
+
+def format_passages(
+    ranked: list[tuple[int, float]],
+    chunks: list[str],
+    meta: list[str],
+    url_to_title: dict[str, str],
+    pages: dict[str, str],
+    fallback_results: list[dict] | None = None,
+    timing_line: str | None = None,
 ) -> str:
+    blocks: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for idx, score in ranked:
+        if score < MIN_RERANK_SCORE:
+            continue
+        url = meta[idx]
+        text = trim_chunk(chunks[idx], max_chars=1800)
+        if not is_good_chunk(text):
+            continue
+        key = (url, text[:160])
+        if key in seen:
+            continue
+        seen.add(key)
+        title = url_to_title.get(url) or url
+        blocks.append(f"[{title}]({url}) (rel {score:.2f})\n{text}")
+
+    if not blocks:
+        fallback = format_snippets(fallback_results or []) if fallback_results else "No useful search snippets available."
+        body = (
+            "No strong crawled passages survived the quality filter. "
+            "Showing search snippets instead.\n\n" + fallback
+        )
+        if timing_line:
+            body += f"\n\n---\n{timing_line}"
+        return body
+
+    sources = "\n".join(
+        f"- [{url_to_title.get(u) or u}]({u})"
+        for u in pages.keys()
+    )
+    body = "## Relevant passages\n\n" + "\n\n---\n\n".join(blocks) + f"\n\n## Sources\n{sources}"
+    if timing_line:
+        body += f"\n\n---\n{timing_line}"
+    return body
+
+
+async def crawl_search_rerank(
+    query: str,
+    cfg: ModeConfig,
+    freshness: str = "",
+    category: str = "general",
+    timing: bool = False,
+) -> str:
+    freshness = _valid_freshness(freshness)
+    category = _valid_category(category)
+
     t0 = time.time()
-    results = await searxng_search(query, num=num_sources,
-                                   time_range=time_range, news=news)
+    results = await searxng_search(query, num=cfg.search_results, freshness=freshness, category=category)
     if not results:
         return "No results found."
     t1 = time.time()
 
+    ranked_results = await asyncio.to_thread(rerank_results_by_snippet, query, results, cfg.crawl_top_n)
+    t1b = time.time()
+
+    urls = [r["url"] for r in ranked_results]
     url_to_title = {r["url"]: r["title"] for r in results}
-    pages = await fetch_pages(list(url_to_title.keys()), page_timeout)
+    pages = await fetch_pages(urls, cfg.page_timeout_ms, freshness, category)
     t2 = time.time()
 
     if not pages:
-        snip = "\n\n".join(
-            f"[{r['title']}]({r['url']})\n{r['snippet']}" for r in results
-        )
-        return f"(crawl returned no content — showing search snippets)\n\n{snip}"
+        body = format_snippets(ranked_results)
+        if timing:
+            body += (
+                f"\n\n---\n[timing] search={t1-t0:.1f}s snippet_rerank={t1b-t1:.1f}s "
+                f"crawl={t2-t1b:.1f}s total={t2-t0:.1f}s | crawl returned no content"
+            )
+        return f"(crawl returned no content — showing search snippets)\n\n{body}"
 
-    all_chunks, meta = [], []
-    for url, md in pages.items():
-        for ch in chunk_text(md, size=chunk_size):
-            all_chunks.append(ch)
-            meta.append(url)
+    chunks, meta = build_chunk_corpus(pages, cfg)
+    if not chunks:
+        t3 = time.time()
+        body = "No useful crawled chunks survived the quality filter. Showing search snippets instead.\n\n" + format_snippets(ranked_results)
+        if timing:
+            body += (
+                f"\n\n---\n[timing] search={t1-t0:.1f}s snippet_rerank={t1b-t1:.1f}s "
+                f"crawl={t2-t1b:.1f}s quality_filter={t3-t2:.1f}s total={t3-t0:.1f}s | "
+                f"category={category} freshness={freshness or 'any'} pages={len(pages)} chunks=0"
+            )
+        return body
 
-    ranked = await asyncio.to_thread(rerank, query, all_chunks, top_chunks)
+    ranked = await asyncio.to_thread(rerank, query, chunks, cfg.top_chunks)
     t3 = time.time()
 
-    blocks, seen = [], set()
-    for idx, score in ranked:
-        url = meta[idx]
-        key = (url, all_chunks[idx][:80])
-        if key in seen:
-            continue
-        seen.add(key)
-        title = url_to_title.get(url, url)
-        blocks.append(
-            f"[{title}]({url}) (rel {score:.2f})\n{all_chunks[idx].strip()}"
-        )
-
-    sources = "\n".join(f"- [{url_to_title[u]}]({u})" for u in pages)
-    body = ("## Relevant passages\n\n"
-            + "\n\n---\n\n".join(blocks)
-            + f"\n\n## Sources\n{sources}")
-
+    timing_line = None
     if timing:
-        body += (f"\n\n---\n[timing] search={t1-t0:.1f}s crawl={t2-t1:.1f}s "
-                 f"rerank={t3-t2:.1f}s total={t3-t0:.1f}s | "
-                 f"pages={len(pages)} chunks={len(all_chunks)}")
-    return body
+        timing_line = (
+            f"[timing] search={t1-t0:.1f}s snippet_rerank={t1b-t1:.1f}s "
+            f"crawl={t2-t1b:.1f}s chunk_rerank={t3-t2:.1f}s total={t3-t0:.1f}s | "
+            f"category={category} freshness={freshness or 'any'} pages={len(pages)} chunks={len(chunks)}"
+        )
+    return format_passages(ranked, chunks, meta, url_to_title, pages, fallback_results=ranked_results, timing_line=timing_line)
+
+# ---------------- Public tool functions ----------------
+async def do_snippets(query: str, freshness: str = "", category: str = "general", timing: bool = False) -> str:
+    freshness = _valid_freshness(freshness)
+    category = _valid_category(category)
+    t0 = time.time()
+    results = await searxng_search(query, num=SNIPPETS_RESULTS, freshness=freshness, category=category)
+    t1 = time.time()
+    line = (
+        f"[timing] search={t1-t0:.1f}s total={t1-t0:.1f}s | "
+        f"category={category} freshness={freshness or 'any'} results={len(results)}"
+    ) if timing else None
+    return format_snippets(results, line)
 
 
-# ---------------- public functions ----------------
-async def do_quick(query: str, time_range: str = "", news: bool = False,
-                   timing: bool = False) -> str:
-    """Fast path: shallow crawl of top 3 results, return ~4 lean passages."""
-    return await _crawl_search_rerank(
-        query, num_sources=3, top_chunks=4, page_timeout=10000,
-        time_range=time_range, news=news, chunk_size=1000, timing=timing,
+async def do_quick_search(query: str, freshness: str = "", category: str = "general", timing: bool = False) -> str:
+    return await crawl_search_rerank(query, QUICK_CFG, freshness=freshness, category=category, timing=timing)
+
+
+async def do_comprehensive_search(query: str, freshness: str = "", category: str = "general", timing: bool = False) -> str:
+    return await crawl_search_rerank(query, COMPREHENSIVE_CFG, freshness=freshness, category=category, timing=timing)
+
+
+async def do_deep_research(
+    query: str,
+    max_depth: int = DEEP_MAX_DEPTH,
+    max_pages: int = DEEP_MAX_PAGES_TOTAL,
+    freshness: str = "",
+    category: str = "general",
+    timing: bool = False,
+) -> str:
+    freshness = _valid_freshness(freshness)
+    category = _valid_category(category)
+    max_depth = max(1, min(max_depth, 3))
+    max_pages = max(5, min(max_pages, 50))
+
+    t0 = time.time()
+    results = await searxng_search(query, num=DEEP_SEARCH_RESULTS, freshness=freshness, category=category)
+    if not results:
+        return "No results found."
+    t1 = time.time()
+
+    seeds = await asyncio.to_thread(rerank_results_by_snippet, query, results, DEEP_SEED_TOP_N)
+    t1b = time.time()
+    seed_urls = [r["url"] for r in seeds]
+
+    pages = await fetch_deep_pages(
+        seed_urls=seed_urls,
+        query=query,
+        max_depth=max_depth,
+        max_pages_total=max_pages,
+        page_timeout_ms=DEEP_PAGE_TIMEOUT_MS,
+        freshness=freshness,
+        category=category,
     )
+    t2 = time.time()
 
+    if not pages:
+        body = format_snippets(seeds)
+        if timing:
+            body += (
+                f"\n\n---\n[timing] search={t1-t0:.1f}s seed_rerank={t1b-t1:.1f}s "
+                f"deep_crawl={t2-t1b:.1f}s total={t2-t0:.1f}s | deep crawl returned no content"
+            )
+        return f"(deep crawl returned no content — showing seed snippets)\n\n{body}"
 
-async def do_research(query: str, num_sources: int = 5, top_chunks: int = 8,
-                      time_range: str = "", news: bool = False,
-                      timing: bool = False) -> str:
-    """Deep path: thorough multi-source crawl, return more passages."""
-    return await _crawl_search_rerank(
-        query, num_sources=num_sources, top_chunks=top_chunks,
-        page_timeout=15000, time_range=time_range, news=news,
-        chunk_size=1200, timing=timing,
-    )
+    url_to_title = {r["url"]: r["title"] for r in results}
+    chunks, meta = build_chunk_corpus(pages, DEEP_CFG)
+    if not chunks:
+        t3 = time.time()
+        body = "No useful deep-crawled chunks survived the quality filter. Showing seed snippets instead.\n\n" + format_snippets(seeds)
+        if timing:
+            body += (
+                f"\n\n---\n[timing] search={t1-t0:.1f}s seed_rerank={t1b-t1:.1f}s "
+                f"deep_crawl={t2-t1b:.1f}s quality_filter={t3-t2:.1f}s total={t3-t0:.1f}s | "
+                f"category={category} freshness={freshness or 'any'} seeds={len(seed_urls)} "
+                f"pages={len(pages)} chunks=0 depth={max_depth} max_pages={max_pages}"
+            )
+        return body
 
+    ranked = await asyncio.to_thread(rerank, query, chunks, DEEP_TOP_CHUNKS)
+    t3 = time.time()
+
+    timing_line = None
+    if timing:
+        timing_line = (
+            f"[timing] search={t1-t0:.1f}s seed_rerank={t1b-t1:.1f}s "
+            f"deep_crawl={t2-t1b:.1f}s chunk_rerank={t3-t2:.1f}s total={t3-t0:.1f}s | "
+            f"category={category} freshness={freshness or 'any'} seeds={len(seed_urls)} "
+            f"pages={len(pages)} chunks={len(chunks)} depth={max_depth} max_pages={max_pages}"
+        )
+    return format_passages(ranked, chunks, meta, url_to_title, pages, fallback_results=seeds, timing_line=timing_line)
 
 # ---------------- MCP server ----------------
 def build_mcp():
-    """Construct the FastMCP server, preload the model, register tools."""
     from mcp.server.fastmcp import FastMCP
-    from mcp.server.transport_security import TransportSecuritySettings
 
-    # Trusted internal cluster: disable DNS-rebinding host validation so
-    # requests via the service FQDN (not just localhost) are accepted.
-    security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-        allowed_hosts=["*"],
-        allowed_origins=["*"],
-    )
+    mcp = FastMCP("web-search")
 
-    mcp = FastMCP("web-search", transport_security=security)
-
-    # Preload the reranker at construction (first call fast; readiness gate).
-    print("[startup] warming reranker...", file=sys.stderr, flush=True)
-    get_reranker()
-    print("[startup] reranker warm — server ready.", file=sys.stderr, flush=True)
+    if PRELOAD_RERANKER:
+        print("[startup] warming reranker...", file=sys.stderr, flush=True)
+        get_reranker()
+        print("[startup] reranker warm — server ready.", file=sys.stderr, flush=True)
+    else:
+        print("[startup] reranker lazy-load enabled.", file=sys.stderr, flush=True)
 
     @mcp.tool()
-    async def quick_answer(query: str, time_range: str = "",
-                           news: bool = False) -> str:
-        """Fast web lookup. Crawls the top results and returns the most
-        relevant content passages. Use for current facts, quick questions,
-        release notes, and recent news.
+    async def web_search_snippets(query: str, category: str = "general", freshness: str = "") -> str:
+        """Fastest web lookup. Uses SearXNG snippets only; no browser crawling.
+
+        Use first for broad discovery, simple current facts, or when snippets
+        are likely enough.
+
+        IMPORTANT FOR THE CALLING LLM:
+        - Always cite the source URLs when using information from this tool.
+        - Do not present claims from this tool without attribution.
+        - Prefer citing the specific source that supports each statement.
 
         Args:
-            query: The search query. Be specific.
-            time_range: Optional recency filter: '' (any), 'day', 'week',
-                'month', 'year'. Use 'day' or 'week' for recent news.
-            news: Set True to restrict to news sources (recency-focused).
+            query: Specific web search query.
+            category: One of general, news, academic, science, it,
+                documentation, github, forums, reddit, stackoverflow.
+            freshness: Optional recency filter: '', 'day', 'week', 'month', 'year'.
         """
-        try:
-            if time_range not in VALID_TIME_RANGES:
-                time_range = ""
-            return await do_quick(query, time_range=time_range, news=news)
-        except Exception as e:
-            import traceback
-            traceback.print_exc(file=sys.stderr)
-            sys.stderr.flush()
-            return f"ERROR in quick_answer: {type(e).__name__}: {e}"
+        return await do_snippets(query, freshness=freshness, category=category)
 
     @mcp.tool()
-    async def deep_research(query: str, num_sources: int = 5,
-                            top_chunks: int = 8, time_range: str = "",
-                            news: bool = False) -> str:
-        """Thorough web research across multiple sources. Crawls several
-        pages, extracts content, and returns reranked passages with
-        citations. Use for complex questions needing comprehensive coverage.
+    async def quick_search(query: str, category: str = "general", freshness: str = "") -> str:
+        """Quick web search with shallow crawling of the top 3 results.
+
+        Best default for readily available information. Searches wider, reranks
+        snippets, crawls only the top candidates, and returns a few relevant
+        passages. Optimized for speed.
+
+        IMPORTANT FOR THE CALLING LLM:
+        - Always cite the source URLs when using information from this tool.
+        - Do not present claims from this tool without attribution.
+        - Prefer citing the specific source that supports each statement.
 
         Args:
-            query: The research question. Be specific.
-            num_sources: How many sources to crawl (3-8).
-            top_chunks: How many passages to return (4-12).
-            time_range: Optional recency filter: '', 'day', 'week', 'month', 'year'.
-            news: Set True to restrict to news sources.
+            query: Specific search query.
+            category: One of general, news, academic, science, it,
+                documentation, github, forums, reddit, stackoverflow.
+            freshness: Optional recency filter: '', 'day', 'week', 'month', 'year'.
         """
-        try:
-            if time_range not in VALID_TIME_RANGES:
-                time_range = ""
-            num_sources = max(1, min(num_sources, 8))
-            top_chunks = max(1, min(top_chunks, 12))
-            return await do_research(query, num_sources=num_sources,
-                                     top_chunks=top_chunks, time_range=time_range,
-                                     news=news)
-        except Exception as e:
-            import traceback
-            traceback.print_exc(file=sys.stderr)
-            sys.stderr.flush()
-            return f"ERROR in deep_research: {type(e).__name__}: {e}"
+        return await do_quick_search(query, freshness=freshness, category=category)
+
+    @mcp.tool()
+    async def comprehensive_search(query: str, category: str = "general", freshness: str = "") -> str:
+        """Comprehensive multi-source search with shallow crawling of top 10 results.
+
+        Use when quick_search is too thin or when comparing multiple sources matters.
+        More complete than quick_search, but slower.
+
+        IMPORTANT FOR THE CALLING LLM:
+        - Always cite the source URLs when using information from this tool.
+        - Do not present claims from this tool without attribution.
+        - Prefer citing the specific source that supports each statement.
+
+        Args:
+            query: Specific search query.
+            category: One of general, news, academic, science, it,
+                documentation, github, forums, reddit, stackoverflow.
+            freshness: Optional recency filter: '', 'day', 'week', 'month', 'year'.
+        """
+        return await do_comprehensive_search(query, freshness=freshness, category=category)
+
+    @mcp.tool()
+    async def deep_research(
+        query: str,
+        category: str = "general",
+        freshness: str = "",
+        max_depth: int = DEEP_MAX_DEPTH,
+        max_pages: int = DEEP_MAX_PAGES_TOTAL,
+    ) -> str:
+        """Deep research using Crawl4AI deep crawling from relevant seed URLs.
+
+        Use for complex topics where important information may live below the
+        initial search result pages: documentation, release notes, multi-page
+        guides, APIs, and technical investigations.
+
+        Guardrails: max_depth is capped at 3 and max_pages at 50.
+
+        IMPORTANT FOR THE CALLING LLM:
+        - Always cite the source URLs when using information from this tool.
+        - Do not present claims from this tool without attribution.
+        - Prefer citing the specific source that supports each statement.
+
+        Args:
+            query: Research question or topic.
+            category: One of general, news, academic, science, it,
+                documentation, github, forums, reddit, stackoverflow.
+            freshness: Optional recency filter: '', 'day', 'week', 'month', 'year'.
+            max_depth: Crawl depth, 1-3. Default 3.
+            max_pages: Total page budget, 5-50. Default from env.
+        """
+        return await do_deep_research(
+            query,
+            max_depth=max_depth,
+            max_pages=max_pages,
+            freshness=freshness,
+            category=category,
+        )
 
     return mcp
 
@@ -379,41 +970,42 @@ def run_mcp():
     if transport in ("streamable-http", "sse"):
         mcp.settings.host = "0.0.0.0"
         mcp.settings.port = PORT
-        print(f"[startup] MCP serving via {transport} on 0.0.0.0:{PORT}",
-              file=sys.stderr, flush=True)
+        print(f"[startup] MCP serving via {transport} on 0.0.0.0:{PORT}", file=sys.stderr, flush=True)
     else:
-        print(f"[startup] MCP serving via {transport}",
-              file=sys.stderr, flush=True)
+        print(f"[startup] MCP serving via {transport}", file=sys.stderr, flush=True)
     mcp.run(transport=transport)
-
 
 # ---------------- CLI ----------------
 def main():
-    parser = argparse.ArgumentParser(description="Search MCP pipeline")
+    parser = argparse.ArgumentParser(description="CPU-friendly Search MCP pipeline")
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    p_quick = sub.add_parser("quick", help="fast shallow search")
-    p_quick.add_argument("query", nargs="+")
-    p_quick.add_argument("--time", default="", choices=sorted(VALID_TIME_RANGES))
-    p_quick.add_argument("--news", action="store_true")
+    def add_common(p):
+        p.add_argument("query", nargs="+")
+        p.add_argument("--freshness", "--time", dest="freshness", default="", choices=sorted(VALID_FRESHNESS))
+        p.add_argument("--category", default="general", choices=sorted(VALID_CATEGORIES))
 
-    p_res = sub.add_parser("research", help="deep multi-source research")
-    p_res.add_argument("query", nargs="+")
-    p_res.add_argument("--sources", type=int, default=5)
-    p_res.add_argument("--chunks", type=int, default=8)
-    p_res.add_argument("--time", default="", choices=sorted(VALID_TIME_RANGES))
-    p_res.add_argument("--news", action="store_true")
+    p_snip = sub.add_parser("snippets", help="SearXNG snippets only")
+    add_common(p_snip)
 
-    p_search = sub.add_parser("search", help="raw SearXNG snippets (debug)")
-    p_search.add_argument("query", nargs="+")
-    p_search.add_argument("--time", default="", choices=sorted(VALID_TIME_RANGES))
-    p_search.add_argument("--news", action="store_true")
+    p_quick = sub.add_parser("quick", help="quick crawl top 3")
+    add_common(p_quick)
 
-    p_bench = sub.add_parser("bench", help="run several queries in one warm process")
+    p_comp = sub.add_parser("comprehensive", help="crawl top 10")
+    add_common(p_comp)
+
+    p_deep = sub.add_parser("deep", help="deep crawl relevant seeds")
+    add_common(p_deep)
+    p_deep.add_argument("--depth", type=int, default=DEEP_MAX_DEPTH)
+    p_deep.add_argument("--max-pages", type=int, default=DEEP_MAX_PAGES_TOTAL)
+
+    p_bench = sub.add_parser("bench", help="run several quick searches in one warm process")
     p_bench.add_argument("query", nargs="+")
     p_bench.add_argument("--runs", type=int, default=3)
+    p_bench.add_argument("--freshness", "--time", dest="freshness", default="", choices=sorted(VALID_FRESHNESS))
+    p_bench.add_argument("--category", default="general", choices=sorted(VALID_CATEGORIES))
 
-    sub.add_parser("mcp", help="run as MCP server (transport from MCP_TRANSPORT)")
+    sub.add_parser("mcp", help="run as MCP server")
 
     args = parser.parse_args()
 
@@ -421,35 +1013,37 @@ def main():
         run_mcp()
         return
 
-    q = " ".join(args.query)
+    q = " ".join(getattr(args, "query", []))
 
-    if args.mode == "quick":
-        print(asyncio.run(do_quick(q, time_range=args.time,
-                                   news=args.news, timing=True)))
-
-    elif args.mode == "research":
-        print(asyncio.run(do_research(q, num_sources=args.sources,
-                                      top_chunks=args.chunks,
-                                      time_range=args.time, news=args.news,
-                                      timing=True)))
-
-    elif args.mode == "search":
-        results = asyncio.run(searxng_search(q, time_range=args.time,
-                                             news=args.news))
-        if not results:
-            print("No results found.")
-        for i, r in enumerate(results, 1):
-            print(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}\n")
-
-    elif args.mode == "bench":
-        async def _bench():
-            get_reranker()  # warm once, like the server does
-            for i in range(args.runs):
-                t = time.time()
-                await do_quick(q)
-                print(f"run {i+1}: {time.time()-t:.1f}s",
-                      file=sys.stderr, flush=True)
-        asyncio.run(_bench())
+    try:
+        if args.mode == "snippets":
+            print(asyncio.run(do_snippets(q, freshness=args.freshness, category=args.category, timing=True)))
+        elif args.mode == "quick":
+            print(asyncio.run(do_quick_search(q, freshness=args.freshness, category=args.category, timing=True)))
+        elif args.mode == "comprehensive":
+            print(asyncio.run(do_comprehensive_search(q, freshness=args.freshness, category=args.category, timing=True)))
+        elif args.mode == "deep":
+            print(asyncio.run(do_deep_research(
+                q,
+                max_depth=args.depth,
+                max_pages=args.max_pages,
+                freshness=args.freshness,
+                category=args.category,
+                timing=True,
+            )))
+        elif args.mode == "bench":
+            async def _bench():
+                get_reranker()
+                for i in range(args.runs):
+                    t = time.time()
+                    await do_quick_search(q, freshness=args.freshness, category=args.category)
+                    print(f"run {i+1}: {time.time()-t:.1f}s", file=sys.stderr, flush=True)
+            asyncio.run(_bench())
+    finally:
+        try:
+            asyncio.run(close_http_client())
+        except RuntimeError:
+            pass
 
 
 if __name__ == "__main__":
